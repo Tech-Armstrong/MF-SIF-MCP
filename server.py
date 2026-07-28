@@ -98,6 +98,76 @@ _VALID_PERIODS = {
 _LONG_PERIODS = {"2Y", "3Y", "5Y"}
 
 
+# ── Azure Blob → local parquet (via the azure-storage-blob SDK) ────────────────
+#
+# We deliberately do NOT use DuckDB's `azure` extension to read az:// URLs. On
+# locked-down hosts (Azure App Service's Linux container) that extension's bundled
+# libcurl can't locate the CA bundle and fails with "Problem with the SSL CA cert".
+# Instead we download the parquet with the azure-storage-blob SDK (which verifies
+# TLS against certifi and works everywhere), cache it under a local dir, and hand
+# DuckDB plain local files. Robust and cert-issue-free.
+
+_LOCAL_CACHE_DIR = os.environ.get("BLOB_CACHE_DIR", "/tmp/navdata")
+
+
+def _parse_az_uri(uri: str) -> tuple[str, str]:
+    """'az://container/path/to/blob' -> ('container', 'path/to/blob')."""
+    rest = re.sub(r"^(az|azure)://", "", uri)
+    container, _, blob_path = rest.partition("/")
+    return container, blob_path
+
+
+def _download_az_to_local(uri: str) -> str:
+    """
+    Download the blob(s) named by an az:// URI to the local cache and return a
+    LOCAL path (or glob) DuckDB can read. Handles two shapes:
+      - a single blob:  az://c/processed/scheme_master.parquet
+      - a glob:         az://c/processed/nav_history/year=*/*.parquet
+    For a glob we list blobs under the fixed prefix (everything before the first
+    wildcard), download each *.parquet, and return a local recursive glob.
+    """
+    from azure.storage.blob import ContainerClient
+
+    container, blob_path = _parse_az_uri(uri)
+    cc = ContainerClient.from_connection_string(AZURE_CONN, container_name=container)
+
+    has_glob = "*" in blob_path
+    # Fixed prefix = the path up to the first path-segment containing a wildcard.
+    prefix = blob_path
+    if has_glob:
+        segments = blob_path.split("/")
+        keep = []
+        for seg in segments:
+            if "*" in seg:
+                break
+            keep.append(seg)
+        prefix = "/".join(keep)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+
+    dest_root = os.path.join(_LOCAL_CACHE_DIR, container)
+    downloaded = 0
+    for blob in cc.list_blobs(name_starts_with=prefix):
+        if not blob.name.endswith(".parquet"):
+            continue
+        local_path = os.path.join(dest_root, blob.name.replace("/", os.sep))
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(cc.download_blob(blob.name).readall())
+        downloaded += 1
+
+    if downloaded == 0:
+        raise RuntimeError(
+            f"No .parquet blobs found under az://{container}/{prefix} "
+            f"(from URI {uri}). Check the container name and path."
+        )
+
+    if has_glob:
+        # A recursive glob covers the year=*/*.parquet layout regardless of depth.
+        return os.path.join(dest_root, "**", "*.parquet")
+    return os.path.join(dest_root, blob_path.replace("/", os.sep))
+
+
 # ── connection (single, long-lived, read-only) ─────────────────────────────────
 
 def _build_connection() -> duckdb.DuckDBPyConnection:
@@ -110,36 +180,19 @@ def _build_connection() -> duckdb.DuckDBPyConnection:
     """
     con = duckdb.connect(database=":memory:")
 
-    # DuckDB can't bind prepared parameters inside CREATE VIEW/SECRET, so paths
-    # are inlined as string literals with single quotes doubled to stay safe.
+    # DuckDB can't bind prepared parameters inside CREATE VIEW, so paths are
+    # inlined as string literals with single quotes doubled to stay safe.
     def _lit(s: str) -> str:
         return "'" + s.replace("'", "''") + "'"
 
     if AZURE_CONN:
-        con.execute("INSTALL azure;")
-        con.execute("LOAD azure;")
-
-        # DuckDB's azure extension makes HTTPS calls to Blob storage and verifies
-        # the TLS cert against a CA bundle. Some hosts (e.g. Azure App Service's
-        # Linux container) don't expose the bundle where DuckDB's bundled libcurl
-        # looks, causing: "Problem with the SSL CA cert (path? access rights?)".
-        # Point DuckDB at the system CA bundle explicitly when one is present.
-        # Guarded by existence so local runs (Windows/macOS) are unaffected.
-        for _ca in ("/etc/ssl/certs/ca-certificates.crt",   # Debian/Ubuntu (App Service)
-                    "/etc/pki/tls/certs/ca-bundle.crt"):     # RHEL/CentOS
-            if os.path.exists(_ca):
-                con.execute(f"SET ca_cert_file = {_lit(_ca)};")
-                break
-
-        # CONNECTION_STRING secret lets read_parquet resolve az:// URLs.
-        con.execute(
-            f"CREATE OR REPLACE SECRET azblob (TYPE azure, CONNECTION_STRING {_lit(AZURE_CONN)});"
-        )
+        # Download from Blob via the SDK, then point DuckDB at local files.
+        nav_path = _download_az_to_local(NAV_HISTORY_PATH)
+        scheme_path = _download_az_to_local(SCHEME_MASTER_PATH)
     else:
-        # Fail early and clearly if local files are missing, rather than at
-        # first query time with an opaque parquet error.
-        missing = [p for p in (NAV_HISTORY_PATH, SCHEME_MASTER_PATH)
-                   if not p.startswith(("az://", "azure://")) and not os.path.exists(p)]
+        # Local mode: fail early and clearly if the parquet is missing.
+        nav_path, scheme_path = NAV_HISTORY_PATH, SCHEME_MASTER_PATH
+        missing = [p for p in (nav_path, scheme_path) if not os.path.exists(p)]
         if missing:
             sys.stderr.write(
                 "NAV MCP: parquet not found: " + ", ".join(missing) + "\n"
@@ -149,10 +202,12 @@ def _build_connection() -> duckdb.DuckDBPyConnection:
             )
 
     con.execute(
-        f"CREATE OR REPLACE VIEW nav_history AS SELECT * FROM read_parquet({_lit(NAV_HISTORY_PATH)});"
+        f"CREATE OR REPLACE VIEW nav_history AS "
+        f"SELECT * FROM read_parquet({_lit(nav_path)});"
     )
     con.execute(
-        f"CREATE OR REPLACE VIEW scheme_master AS SELECT * FROM read_parquet({_lit(SCHEME_MASTER_PATH)});"
+        f"CREATE OR REPLACE VIEW scheme_master AS "
+        f"SELECT * FROM read_parquet({_lit(scheme_path)});"
     )
     return con
 

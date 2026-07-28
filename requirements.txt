@@ -1,6 +1,9 @@
 fastmcp==3.4.4
 duckdb==1.5.4
 python-dateutil==2.9.0.post0
+# Reads parquet from Azure Blob via the SDK (verifies TLS against certifi), so we
+# avoid DuckDB's azure extension, which fails on locked-down hosts (App Service).
+azure-storage-blob==12.23.1
 # mcp is pulled in transitively by fastmcp; pinned here because mcp_client_test.py
 # imports the client directly (mcp.client.stdio).
 mcp==1.28.1
