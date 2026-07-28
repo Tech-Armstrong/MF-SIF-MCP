@@ -413,23 +413,32 @@ def _build_auth():
     """
     Return an OAuth provider for the claude.ai custom-connector handshake, or None.
 
-    claude.ai's "Add custom connector" flow performs an OAuth 2.0 exchange, so a
-    hosted server needs an OAuth provider — a static token is not accepted by the
-    connector UI. We use fastmcp's self-contained InMemoryOAuthProvider: it stands
-    up its own OAuth authorization server and supports Dynamic Client Registration,
-    so claude.ai can register and complete the handshake with no external identity
-    provider, no app registration, and no scope configuration. Any client that
-    completes the flow is granted access — appropriate for a small trusted team
-    behind a URL you control, gating on knowledge of the URL plus the handshake.
+    claude.ai's "Add custom connector" flow performs an OAuth 2.0 exchange. It does
+    NOT support Dynamic Client Registration — the connector UI requires you to paste
+    a pre-existing OAuth Client ID (and Secret). So we stand up fastmcp's
+    self-contained InMemoryOAuthProvider (its own authorization server — no external
+    identity provider, no Azure app registration, no scope config) and pre-register
+    ONE fixed client from env vars. You paste that same client_id / client_secret
+    into claude.ai when adding the connector.
 
-    Auth turns on only when PUBLIC_BASE_URL is set (to the externally reachable
-    https base of the deployed server, e.g. https://<app>.azurewebsites.net —
-    OAuth endpoints are advertised relative to it). With it unset the server runs
-    unauthenticated, which is what local stdio / HTTP smoke tests (and the existing
-    mcp_client_test.py) rely on.
+    Required env vars to enable auth:
+        PUBLIC_BASE_URL     externally reachable https base, e.g.
+                            https://<app>.azurewebsites.net (OAuth endpoints are
+                            advertised relative to it).
+        OAUTH_CLIENT_ID     the client id you'll paste into claude.ai.
+        OAUTH_CLIENT_SECRET the client secret you'll paste into claude.ai.
+    Optional:
+        OAUTH_REDIRECT_URIS space-separated allowed redirect URIs; defaults to
+                            claude.ai's connector callback.
 
-    Note: tokens live in memory, so a server restart forces teammates to
-    re-authenticate (a one-click re-consent, not a re-setup). For durable tokens
+    If PUBLIC_BASE_URL is unset the server runs UNAUTHENTICATED (local stdio / HTTP
+    smoke tests, and the existing mcp_client_test.py, rely on this). If
+    PUBLIC_BASE_URL is set but the client id/secret are not, we fail fast with a
+    clear message rather than booting an unusable connector.
+
+    Note: registrations/tokens live in memory. The pre-registered client is
+    re-seeded on every startup (so it survives restarts), but issued access tokens
+    do not — a restart makes teammates click "reconnect" once. For durable tokens
     or real per-user identity + revocation, swap in a hosted provider (Google/
     GitHub/WorkOS) later — same call site, only this function changes.
     """
@@ -437,9 +446,35 @@ def _build_auth():
     if not base_url:
         return None
 
-    from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
+    client_id = os.environ.get("OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("OAUTH_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        sys.stderr.write(
+            "NAV MCP: PUBLIC_BASE_URL is set (OAuth on) but OAUTH_CLIENT_ID / "
+            "OAUTH_CLIENT_SECRET are not. Set both, then paste the same values "
+            "into claude.ai's Add-custom-connector form.\n"
+        )
+        raise SystemExit(1)
 
-    return InMemoryOAuthProvider(base_url=base_url)
+    redirect_uris = os.environ.get(
+        "OAUTH_REDIRECT_URIS", "https://claude.ai/api/mcp/auth_callback"
+    ).split()
+
+    from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    provider = InMemoryOAuthProvider(base_url=base_url)
+    # Pre-register the fixed client so claude.ai (which doesn't do Dynamic Client
+    # Registration) can authenticate with the id/secret you paste into its UI.
+    provider.clients[client_id] = OAuthClientInformationFull(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uris=redirect_uris,
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+        token_endpoint_auth_method="client_secret_post",
+    )
+    return provider
 
 
 # ── MCP app + tools ─────────────────────────────────────────────────────────────
