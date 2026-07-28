@@ -118,6 +118,19 @@ def _build_connection() -> duckdb.DuckDBPyConnection:
     if AZURE_CONN:
         con.execute("INSTALL azure;")
         con.execute("LOAD azure;")
+
+        # DuckDB's azure extension makes HTTPS calls to Blob storage and verifies
+        # the TLS cert against a CA bundle. Some hosts (e.g. Azure App Service's
+        # Linux container) don't expose the bundle where DuckDB's bundled libcurl
+        # looks, causing: "Problem with the SSL CA cert (path? access rights?)".
+        # Point DuckDB at the system CA bundle explicitly when one is present.
+        # Guarded by existence so local runs (Windows/macOS) are unaffected.
+        for _ca in ("/etc/ssl/certs/ca-certificates.crt",   # Debian/Ubuntu (App Service)
+                    "/etc/pki/tls/certs/ca-bundle.crt"):     # RHEL/CentOS
+            if os.path.exists(_ca):
+                con.execute(f"SET ca_cert_file = {_lit(_ca)};")
+                break
+
         # CONNECTION_STRING secret lets read_parquet resolve az:// URLs.
         con.execute(
             f"CREATE OR REPLACE SECRET azblob (TYPE azure, CONNECTION_STRING {_lit(AZURE_CONN)});"
