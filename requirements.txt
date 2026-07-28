@@ -1,0 +1,6 @@
+fastmcp==3.4.4
+duckdb==1.5.4
+python-dateutil==2.9.0.post0
+# mcp is pulled in transitively by fastmcp; pinned here because mcp_client_test.py
+# imports the client directly (mcp.client.stdio).
+mcp==1.28.1

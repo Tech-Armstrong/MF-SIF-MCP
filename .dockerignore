@@ -1,0 +1,28 @@
+# Keep the deployed image minimal and secret-free.
+# The Dockerfile only COPYs requirements.txt and server.py; everything else
+# here is belt-and-suspenders so nothing sensitive or unnecessary can leak in.
+
+# Secrets — the deployed server gets its config from App Service settings,
+# never from a file baked into the image.
+.env
+.cursor/
+
+# Virtual environment (deps are installed fresh from requirements.txt)
+venv/
+
+# Build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Local-only: synthetic fixture (prod reads Azure Blob), tests, demo, notes
+data/
+mcp_client_test.py
+demo.py
+make_sample_data.py
+mcp-server-build.md
+README.md
+.gitignore
+
+# Separate SIF pipeline config — not part of the MCP server runtime
+sif/
