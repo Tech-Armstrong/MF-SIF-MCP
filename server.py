@@ -163,8 +163,13 @@ def _download_az_to_local(uri: str) -> str:
         )
 
     if has_glob:
-        # A recursive glob covers the year=*/*.parquet layout regardless of depth.
-        return os.path.join(dest_root, "**", "*.parquet")
+        # Root the recursive glob at the fixed PREFIX subdir (e.g. nav_history/),
+        # not the container root — otherwise it would also match sibling datasets
+        # like scheme_master.parquet, and DuckDB would try to union mismatched
+        # schemas ("column nav_date ... could not be found"). The glob covers the
+        # year=*/*.parquet layout regardless of depth.
+        prefix_local = os.path.join(dest_root, prefix.rstrip("/").replace("/", os.sep))
+        return os.path.join(prefix_local, "**", "*.parquet")
     return os.path.join(dest_root, blob_path.replace("/", os.sep))
 
 
