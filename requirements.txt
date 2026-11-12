@@ -7,3 +7,9 @@ azure-storage-blob==12.23.1
 # mcp is pulled in transitively by fastmcp; pinned here because mcp_client_test.py
 # imports the client directly (mcp.client.stdio).
 mcp==1.28.1
+# Needed by sif/config/constants.py (load_dotenv), and by server.py to read the
+# NEO4J_* / SIF_* keys of a local .env when present (none in the deployed image).
+python-dotenv==1.2.2
+# SIF portfolios / managers for the sif_* tools (Neo4j, loaded by historical-sif).
+# Optional at runtime: without NEO4J_* settings the server starts and only those tools report it.
+neo4j==6.4.1

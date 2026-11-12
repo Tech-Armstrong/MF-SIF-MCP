@@ -16,6 +16,10 @@ Tools exposed
                                         returns for every fund in a category
     list_categories()                   distinct category names
     list_funds_in_category(category)    schemes in a category
+    sif_get_holdings(fund, year, month, asset_class, top)
+                                        SIF monthly portfolio (Neo4j)
+    sif_get_managers(fund, manager)     SIF fund-manager tenures (Neo4j)
+    sif_get_aum_history(fund)           SIF month-by-month AUM (Neo4j)
 
 Supported period strings
 ------------------------
@@ -52,6 +56,14 @@ Configuration (environment variables)
                          else (default) serves streamable HTTP at /mcp.
     PORT                 HTTP listen port (default 8000; App Service injects this).
 
+    NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
+                         the SIF Neo4j database (e.g. neo4j+s://<id>.databases.neo4j.io)
+                         for the sif_* tools; unset = those tools report unavailable.
+                         For local runs these may also live in a .env beside server.py.
+    NEO4J_DATABASE       database name (default: neo4j)
+    SIF_QUERY_TIMEOUT_SECONDS
+                         per-query timeout for the sif_* tools (default 30)
+
     PUBLIC_BASE_URL      Enables OAuth for the claude.ai connector when set to the
                          externally reachable https base of the deployed server,
                          e.g. https://<app>.azurewebsites.net. A self-contained
@@ -72,10 +84,12 @@ No data yet? Generate a synthetic fixture to smoke-test the server:
 
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import sys
 import re
 from datetime import date, timedelta
+import threading
 from typing import Optional, Union
 
 import duckdb
@@ -83,6 +97,21 @@ from dateutil.relativedelta import relativedelta
 from fastmcp import FastMCP
 
 # ── configuration ─────────────────────────────────────────────────────────────
+
+# Local runs: take the data settings (NEO4J_*, SIF_*, and the SIF NAV Blob
+# settings NAV_HISTORY_PATH / SCHEME_MASTER_PATH / AZURE_STORAGE_CONNECTION_STRING)
+# from the .env beside this file, so `python server.py` and the MCP Inspector
+# reach the real data without exporting anything first. Variables already set
+# win. The deployed image has no .env (see .dockerignore), so App Service
+# settings are untouched.
+_DOTENV_KEYS = ("NAV_HISTORY_PATH", "SCHEME_MASTER_PATH", "AZURE_STORAGE_CONNECTION_STRING")
+try:
+    from dotenv import dotenv_values
+    for _key, _value in dotenv_values(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")).items():
+        if (_key.startswith(("NEO4J_", "SIF_")) or _key in _DOTENV_KEYS) and _value is not None:
+            os.environ.setdefault(_key, _value)
+except ImportError:
+    pass
 
 NAV_HISTORY_PATH = os.environ.get("NAV_HISTORY_PATH", "./data/nav_history.parquet")
 SCHEME_MASTER_PATH = os.environ.get("SCHEME_MASTER_PATH", "./data/scheme_master.parquet")
@@ -481,6 +510,210 @@ def _build_auth():
     )
     return provider
 
+#--Neo4j Connection--
+# ── SIF portfolios (Neo4j) ─────────────────────────────────────────────────────
+#
+# Monthly SIF portfolios, AUM and fund managers, loaded into Neo4j by the
+# historical-sif project (ingestion-pipeline/neo4j_parser.py). Optional, like the
+# index data: without NEO4J_* settings (or the neo4j package) the server still
+# starts and only the sif_* tools report that the data is unavailable.
+#
+# There is no "connect" tool. One driver is created on first use and reused for
+# the life of the process (it pools its own connections), the same way _db()
+# serves DuckDB. Every query runs in a READ transaction, so a write is refused by
+# the database itself; _SIF_WRITE_RX only turns that into a clearer message.
+
+NEO4J_URI = os.environ.get("NEO4J_URI")
+NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD")
+NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
+SIF_QUERY_TIMEOUT_SECONDS = float(os.environ.get("SIF_QUERY_TIMEOUT_SECONDS", "30"))
+SIF_MAX_ROWS = 1000
+
+_NEO4J_LOCK = threading.Lock()
+_NEO4J_DRIVER = None
+
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"]
+
+# write / admin clauses, matched after string literals and comments are removed
+_SIF_WRITE_RX = re.compile(
+    r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|FOREACH|LOAD\s+CSV|GRANT|DENY|REVOKE|ALTER|RENAME)\b"
+    r"|\bIN\s+TRANSACTIONS\b|\b(apoc\.(create|merge|refactor|periodic|load|import|export|trigger|atomic|cypher)|dbms\.)",
+    re.I,
+)
+
+_SIF_SCHEMA = {
+    "nodes": {
+        "SIF_FUND": {
+            "sifCode": "AMFI SIF code, e.g. 'SIF-13' (unique)",
+            "sifFundName": "e.g. 'Magnum Hybrid Long-Short Fund'",
+            "sifCategory": "SEBI SIF strategy, e.g. 'Hybrid Long-Short', 'Equity Long-Short', 'Equity Ex-Top 100 Long-Short'",
+        },
+        "SIF_MONTHLY_SNAPSHOT": {
+            "sifCode": "the fund's code (unique with sifYear + sifMonth)",
+            "sifYear": "integer, e.g. 2026",
+            "sifMonth": "FULL month name string, e.g. 'August' (not 8, not 'Aug')",
+            "sifReportedDate": "FIRST day of the portfolio month, e.g. date('2026-08-01') for the 31 Aug 2026 portfolio; use it to order or filter months",
+            "sifAUM": "month-end AUM in Rs crore from the factsheet; null if no factsheet",
+        },
+        "SIF_ASSET_CLASS": {
+            "sifName": "'Equity', 'Debt', 'Cash and Cash Equivalents', 'REITs & InvITs', 'MF and ETF', 'Commodities' or 'AIF'",
+            "sifSnapshotYear / sifSnapshotMonth": "copy of the snapshot's year / month",
+        },
+        "SIF_INSTRUMENT": {
+            "sifISIN": "ISIN (unique). Derivatives have synthetic keys (e.g. 'HBL-SF-R3ELM1', 'INR-IRS-1JKT2Y'); "
+                       "each fund-month's cash is one row keyed 'CASHANDEQ'",
+            "sifName": "instrument name",
+            "sifAssetClass": "asset class",
+            "sifSubType": "e.g. 'Listed Equity', 'Corporate Bonds / Debentures', 'Treasury Bills'; null for derivatives",
+            "sifSector / sifIndustry": "sector and industry (equity); 'Others' for non-equity",
+            "sifSymbol": "NSE symbol (equity)",
+            "sifMarketCap": "'Large Cap' / 'Mid Cap' / 'Small Cap' (equity)",
+        },
+        "SIF_FUND_MANAGER": {"sifName": "manager's name (unique)"},
+    },
+    "relationships": {
+        "(SIF_FUND)-[:SIF_LATEST_MONTHLY_SNAPSHOT]->(SIF_MONTHLY_SNAPSHOT)": "the fund's newest month",
+        "(SIF_MONTHLY_SNAPSHOT)-[:SIF_PREVIOUS_MONTHLY_SNAPSHOT]->(SIF_MONTHLY_SNAPSHOT)": "newer -> the month before it",
+        "(SIF_MONTHLY_SNAPSHOT)-[:SIF_HAS_ASSET_CLASS]->(SIF_ASSET_CLASS)": "one asset-class node per snapshot",
+        "(SIF_ASSET_CLASS)-[:SIF_HAS_INSTRUMENT {sifHoldings, sifSubType, sifIncludedInNetAssets}]->(SIF_INSTRUMENT)":
+            "sifHoldings = % of net assets in that month; sifSubType adds the derivative type "
+            "('derivative-hedging', 'derivative-directional-position', 'derivatives', 'interest-rate-swaps-derivative')",
+        "(SIF_FUND_MANAGER)-[:SIF_MANAGES {sifStartDate, sifEndDate}]->(SIF_FUND)":
+            "dates are strings: sifStartDate 'Oct-2025'; sifEndDate 'Mon-YYYY', 'present' or null",
+    },
+    "rules": [
+        "A snapshot is NOT linked to its fund except through SIF_LATEST_MONTHLY_SNAPSHOT: join any month on "
+        "sifCode, e.g. MATCH (f:SIF_FUND), (s:SIF_MONTHLY_SNAPSHOT {sifCode: f.sifCode}).",
+        "Holdings live on the SIF_HAS_INSTRUMENT relationship, not on the instrument node; instrument nodes are "
+        "shared by every fund and month that holds them.",
+        "A month's holdings sum to ~100 (only what the AMC counts in net assets). Short option / futures legs "
+        "are negative. Weights are as printed by the AMC, so a few months differ from 100 by rounding.",
+        "Order months by sifReportedDate, not by sifMonth (a string).",
+        "Some SIF_FUND nodes have managers but no snapshots yet (portfolio not loaded).",
+    ],
+    "examples": {
+        "total holdings per fund-month":
+            "MATCH (f:SIF_FUND) MATCH (s:SIF_MONTHLY_SNAPSHOT {sifCode: f.sifCode})-[:SIF_HAS_ASSET_CLASS]->()"
+            "-[h:SIF_HAS_INSTRUMENT]->() RETURN f.sifFundName, s.sifYear, s.sifMonth, round(sum(h.sifHoldings), 2) "
+            "AS total ORDER BY f.sifFundName, s.sifReportedDate",
+        "funds holding a stock in their latest month":
+            "MATCH (f:SIF_FUND)-[:SIF_LATEST_MONTHLY_SNAPSHOT]->(s)-[:SIF_HAS_ASSET_CLASS]->()-[h:SIF_HAS_INSTRUMENT]->"
+            "(i:SIF_INSTRUMENT {sifSymbol: $symbol}) RETURN f.sifFundName, s.sifMonth, s.sifYear, h.sifHoldings "
+            "ORDER BY h.sifHoldings DESC",
+        "sector split of one fund-month":
+            "MATCH (s:SIF_MONTHLY_SNAPSHOT {sifCode: $code, sifYear: 2026, sifMonth: 'August'})-[:SIF_HAS_ASSET_CLASS]->"
+            "(:SIF_ASSET_CLASS {sifName: 'Equity'})-[h:SIF_HAS_INSTRUMENT]->(i) WHERE h.sifSubType = 'Listed Equity' "
+            "RETURN i.sifSector AS sector, round(sum(h.sifHoldings), 2) AS pct ORDER BY pct DESC",
+    },
+}
+
+
+def _neo4j():
+    """The shared Neo4j driver, created and checked on first use."""
+    global _NEO4J_DRIVER
+    with _NEO4J_LOCK:
+        if _NEO4J_DRIVER is None:
+            if not (NEO4J_URI and NEO4J_USERNAME and NEO4J_PASSWORD):
+                raise ValueError(
+                    "SIF data is not configured on this server: set NEO4J_URI, "
+                    "NEO4J_USERNAME and NEO4J_PASSWORD.")
+            try:
+                from neo4j import GraphDatabase
+            except ImportError as exc:
+                raise ValueError(
+                    "The neo4j package is not installed on this server "
+                    "(pip install -r requirements.txt).") from exc
+            # liveness check: Aura drops idle connections, so test a pooled one
+            # that has been idle a while before handing it out
+            driver = GraphDatabase.driver(
+                NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD), liveness_check_timeout=60)
+            try:
+                driver.verify_connectivity()
+            except Exception as exc:
+                driver.close()
+                raise ValueError(f"Could not connect to the SIF Neo4j database: {exc}") from exc
+            _NEO4J_DRIVER = driver
+        return _NEO4J_DRIVER
+    
+def _sif_value(value):
+    """A Neo4j value as plain JSON: dates as ISO strings, nodes / relationships as property dicts."""
+    from neo4j.graph import Node, Path, Relationship
+
+    if isinstance(value, Node):
+        return {"_labels": sorted(value.labels), **{k: _sif_value(v) for k, v in value.items()}}
+    if isinstance(value, Relationship):
+        return {"_type": value.type, **{k: _sif_value(v) for k, v in value.items()}}
+    if isinstance(value, Path):
+        return {"nodes": [_sif_value(n) for n in value.nodes],
+                "relationships": [_sif_value(r) for r in value.relationships]}
+    if isinstance(value, (list, tuple)):
+        return [_sif_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sif_value(v) for k, v in value.items()}
+    if hasattr(value, "iso_format"):  # neo4j.time Date / DateTime / Time / Duration
+        return value.iso_format()
+    return value
+
+
+def _sif_read(cypher: str, params: Optional[dict] = None, limit: int = SIF_MAX_ROWS) -> tuple[list[dict], bool]:
+    """(rows, truncated): run one Cypher query in a read transaction, at most `limit` rows."""
+    from neo4j import READ_ACCESS, unit_of_work
+
+    @unit_of_work(timeout=SIF_QUERY_TIMEOUT_SECONDS)
+    def work(tx):
+        rows = []
+        for record in tx.run(cypher, params or {}):
+            if len(rows) >= limit:
+                return rows, True
+            rows.append({k: _sif_value(v) for k, v in record.items()})
+        return rows, False
+
+    with _neo4j().session(database=NEO4J_DATABASE, default_access_mode=READ_ACCESS) as session:
+        return session.execute_read(work)
+
+
+def _sif_norm(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split())
+
+
+def _sif_fund(fund: str) -> dict:
+    """{'sif_code', 'fund_name', 'category'} for a SIF code or a (partial) fund name."""
+    funds, _ = _sif_read(
+        "MATCH (f:SIF_FUND) RETURN f.sifCode AS sif_code, f.sifFundName AS fund_name, f.sifCategory AS category")
+    wanted = _sif_norm(fund)
+    for f in funds:
+        if wanted in (_sif_norm(f["sif_code"]), _sif_norm(f["fund_name"])):
+            return f
+    tokens = wanted.split()
+    hits = [f for f in funds if tokens and all(t in _sif_norm(f["fund_name"]) for t in tokens)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise ValueError(f"No SIF fund matches '{fund}'. Use sif_list_funds() to see the funds and their codes.")
+    raise ValueError(f"'{fund}' matches {len(hits)} SIF funds; pass one sif_code: "
+                     + "; ".join(f"{f['sif_code']} = {f['fund_name']}" for f in hits))
+
+
+def _sif_month(month: Union[int, str, None]) -> Optional[str]:
+    """8 / '08' / 'aug' / 'August' -> 'August' (the form stored on snapshots)."""
+    if month is None or str(month).strip() == "":
+        return None
+    m = str(month).strip().lower()
+    if m.isdigit() and 1 <= int(m) <= 12:
+        return _MONTHS[int(m) - 1]
+    for name in _MONTHS:
+        if m in (name.lower(), name[:3].lower()):
+            return name
+    raise ValueError(f"Invalid month '{month}': use 1-12, 'Aug' or 'August'.")
+
+
+def _sif_months_available(code: str) -> list[str]:
+    rows, _ = _sif_read(
+        "MATCH (s:SIF_MONTHLY_SNAPSHOT {sifCode: $code}) RETURN s.sifMonth + ' ' + toString(s.sifYear) AS m "
+        "ORDER BY s.sifReportedDate", {"code": code})
+    return [r["m"] for r in rows]
 
 # ── MCP app + tools ─────────────────────────────────────────────────────────────
 
@@ -653,6 +886,126 @@ def list_funds_in_category(category: str) -> dict:
     ).fetchall()
     funds = [{"scheme_code": r[0], "scheme_name": r[1], "fund_house": r[2]} for r in rows]
     return {"category": category.upper(), "total": len(funds), "funds": funds}
+
+
+@mcp.tool()
+def sif_get_holdings(
+    fund: str,
+    year: int = 0,
+    month: str = "",
+    asset_class: str = "",
+    top: int = 0,
+) -> dict:
+    """A SIF fund's portfolio for one month: every holding with its weight, plus AUM.
+
+    Leave year (0) and month ("") empty for the latest month; give only a year
+    for that year's latest month. `requested` echoes the filters received and
+    `month` / `year` are the month actually returned. Weights are % of net assets and sum to ~100 across all
+    asset classes; short option / futures legs are negative. Cash and cash
+    equivalents are one row. `by_asset_class` gives the split.
+
+    Args:
+        fund: sif_code (e.g. 'SIF-13') or fund name (e.g. 'Magnum Hybrid').
+        year: e.g. 2026. 0 = any year.
+        month: '8', 'Aug' or 'August'. Empty = latest.
+        asset_class: Only this asset class, e.g. 'Equity' or 'Debt'. The totals
+            still cover the whole portfolio. Empty = all.
+        top: Only the N largest holdings (by absolute weight). 0 = all.
+    """
+    f = _sif_fund(fund)
+    month_name = _sif_month(month)
+    year = int(year) if year else None
+    requested = {"year": year, "month": month_name, "asset_class": asset_class or None, "top": top or None}
+    rows, _ = _sif_read(
+        """MATCH (s:SIF_MONTHLY_SNAPSHOT {sifCode: $code})
+           WHERE ($year IS NULL OR s.sifYear = $year) AND ($month IS NULL OR s.sifMonth = $month)
+           WITH s ORDER BY s.sifReportedDate DESC LIMIT 1
+           MATCH (s)-[:SIF_HAS_ASSET_CLASS]->(ac:SIF_ASSET_CLASS)-[h:SIF_HAS_INSTRUMENT]->(i:SIF_INSTRUMENT)
+           RETURN s.sifYear AS year, s.sifMonth AS month, s.sifReportedDate AS month_start, s.sifAUM AS aum_cr,
+                  ac.sifName AS asset_class, i.sifName AS instrument, i.sifISIN AS isin,
+                  h.sifHoldings AS weight_pct, h.sifSubType AS sub_type, i.sifSector AS sector,
+                  i.sifIndustry AS industry, i.sifSymbol AS symbol, i.sifMarketCap AS market_cap
+           ORDER BY abs(h.sifHoldings) DESC""",
+        {"code": f["sif_code"], "year": year, "month": month_name})
+    if not rows:
+        available = _sif_months_available(f["sif_code"])
+        when = " ".join(str(x) for x in (month_name, year) if x) or "any month"
+        return {**f, "found": False, "requested": requested, "months_available": available,
+                "error": f"No portfolio for {f['fund_name']} in {when}."}
+
+    by_class = {}
+    for r in rows:
+        c = by_class.setdefault(r["asset_class"], {"asset_class": r["asset_class"], "weight_pct": 0.0, "holdings": 0})
+        c["weight_pct"] += r["weight_pct"] or 0
+        c["holdings"] += 1
+    head = rows[0]
+    holdings = [{k: r[k] for k in ("instrument", "isin", "asset_class", "sub_type", "weight_pct", "sector",
+                                   "industry", "symbol", "market_cap")}
+                for r in rows if not asset_class or (r["asset_class"] or "").lower() == asset_class.strip().lower()]
+    if top:
+        holdings = holdings[:max(1, int(top))]
+    return {
+        **f, "found": True, "requested": requested, "year": head["year"], "month": head["month"], "month_start": head["month_start"],
+        "aum_cr": head["aum_cr"],
+        "total_weight_pct": round(sum(r["weight_pct"] or 0 for r in rows), 4),
+        "holding_count": len(rows),
+        "by_asset_class": sorted(({**c, "weight_pct": round(c["weight_pct"], 4)} for c in by_class.values()),
+                                 key=lambda c: -c["weight_pct"]),
+        "holdings": holdings,
+    }
+
+
+@mcp.tool()
+def sif_get_managers(fund: str = "", manager: str = "") -> dict:
+    """SIF fund managers and their tenures.
+
+    Give `fund` for a fund's managers, or `manager` for the SIF funds a person
+    manages (case-insensitive partial name). Each tenure has a start date
+    ('Oct-2025': the date printed in the factsheet, else the first factsheet
+    month listing them) and an end date ('present' while still listed).
+
+    Args:
+        fund: sif_code (e.g. 'SIF-13') or fund name.
+        manager: Manager name, e.g. 'Nilesh Saha'.
+    """
+    if not fund and not manager:
+        raise ValueError("Give a fund or a manager.")
+    params = {"code": _sif_fund(fund)["sif_code"] if fund else None,
+              "manager": manager.strip().lower() if manager else None}
+    rows, _ = _sif_read(
+        """MATCH (m:SIF_FUND_MANAGER)-[r:SIF_MANAGES]->(f:SIF_FUND)
+           WHERE ($code IS NULL OR f.sifCode = $code)
+             AND ($manager IS NULL OR toLower(m.sifName) CONTAINS $manager)
+           RETURN m.sifName AS manager, f.sifCode AS sif_code, f.sifFundName AS fund_name,
+                  f.sifCategory AS category, r.sifStartDate AS start_date, r.sifEndDate AS end_date""",
+        params)
+
+    def start_key(r):
+        try:
+            return _dt.datetime.strptime(r["start_date"], "%b-%Y")
+        except (TypeError, ValueError):
+            return _dt.datetime.max
+
+    rows.sort(key=lambda r: (r["fund_name"] or "", start_key(r), r["manager"] or ""))
+    return {"fund": fund or None, "manager": manager or None, "total": len(rows), "tenures": rows}
+
+
+@mcp.tool()
+def sif_get_aum_history(fund: str) -> dict:
+    """Month-by-month AUM (Rs crore) of a SIF fund, with each month's holding count and total weight.
+
+    Args:
+        fund: sif_code (e.g. 'SIF-13') or fund name.
+    """
+    f = _sif_fund(fund)
+    rows, _ = _sif_read(
+        """MATCH (s:SIF_MONTHLY_SNAPSHOT {sifCode: $code})
+           OPTIONAL MATCH (s)-[:SIF_HAS_ASSET_CLASS]->()-[h:SIF_HAS_INSTRUMENT]->()
+           RETURN s.sifYear AS year, s.sifMonth AS month, s.sifReportedDate AS month_start, s.sifAUM AS aum_cr,
+                  count(h) AS holding_count, round(sum(h.sifHoldings), 4) AS total_weight_pct
+           ORDER BY month_start""",
+        {"code": f["sif_code"]})
+    return {**f, "months": len(rows), "history": rows}
 
 
 if __name__ == "__main__":
